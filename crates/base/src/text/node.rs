@@ -10,8 +10,8 @@ use gpui::{
     GlobalElementId, HighlightStyle, Hsla, Image, ImageFormat, ImageSource, InspectorElementId,
     InteractiveElement as _, IntoElement, IsZero as _, LayoutId, Length, MouseButton, ObjectFit,
     Overflow, ParentElement, Pixels, Point, Rems, ScrollHandle, SharedString, SharedUri,
-    StatefulInteractiveElement, StyleRefinement, Styled, StyledImage as _, WhiteSpace, Window, div, img, prelude::FluentBuilder as _, px, relative,
-    rems,
+    StatefulInteractiveElement, StyleRefinement, Styled, StyledImage as _, WhiteSpace, Window, div,
+    img, prelude::FluentBuilder as _, px, relative, rems,
 };
 use markdown::mdast;
 
@@ -24,7 +24,7 @@ use crate::{
         document::NodeRenderOptions,
         inline::{
             Inline, InlineHighlight, InlineState, combine_highlights, fade_highlights,
-            point_in_text_selection, text_runs, text_size_ranges,
+            foreground_highlights, point_in_text_selection, text_runs, text_size_ranges,
         },
         inline_flow::{InlineFlow, InlineFlowItem, slice_ranges},
         range_highlight::{RangeHighlightFrame, RevealAt, RevealRequest},
@@ -1596,6 +1596,7 @@ impl std::fmt::Debug for ParagraphRenderCache {
 struct ParagraphRender {
     style: Arc<TextViewStyle>,
     mono_font: SharedString,
+    background: Hsla,
     text: SharedString,
     highlights: Vec<(Range<usize>, InlineHighlight)>,
     /// Links as written, before reference resolution.
@@ -1634,15 +1635,22 @@ impl Paragraph {
         Vec<(Range<usize>, LinkMark)>,
     ) {
         let mono_font = cx.theme().tokens.typography.mono.clone();
+        let background = cx.theme().tokens.colors.background;
         if let Ok(cache) = self.render_cache.0.lock()
             && let Some(cached) = cache.as_ref()
             && (Arc::ptr_eq(&cached.style, &node_cx.style) || *cached.style == *node_cx.style)
             && cached.mono_font == mono_font
             && cached.issue_link_base == node_cx.issue_link_base
+            && cached.background == background
         {
             return (
                 cached.text.clone(),
-                cached.highlights.clone(),
+                foreground_highlights(
+                    cached.highlights.clone(),
+                    &cached.text,
+                    0,
+                    node_cx.foregrounds(self.leaf_key()),
+                ),
                 cached.links.clone(),
             );
         }
@@ -1676,12 +1684,15 @@ impl Paragraph {
             *cache = Some(Arc::new(ParagraphRender {
                 style: node_cx.style.clone(),
                 mono_font,
+                background,
                 text: text.clone(),
                 highlights: highlights.clone(),
                 links: links.clone(),
                 issue_link_base: node_cx.issue_link_base.clone(),
             }));
         }
+        let highlights =
+            foreground_highlights(highlights, &text, 0, node_cx.foregrounds(self.leaf_key()));
         (text, highlights, links)
     }
 
@@ -2680,6 +2691,8 @@ pub(crate) struct NodeContext {
     pub(crate) stream_fade: Option<Arc<StreamFadeFrame>>,
     /// The application's range highlights, when there are any.
     pub(crate) range_highlights: Option<Arc<RangeHighlightFrame>>,
+    /// Render-local glyph colors supplied by an external editor, keyed by leaf.
+    pub(crate) foregrounds: Option<Arc<HashMap<u64, Vec<(Range<usize>, Hsla)>>>>,
     /// The line being scrolled into view, when there is one.
     pub(crate) reveal: Option<RevealRequest>,
     /// Where a `#123` reference in prose links to, its number appended
@@ -2722,6 +2735,11 @@ impl NodeContext {
             }
         }
         Cow::Owned(marks)
+    }
+
+    fn foregrounds(&self, key: Option<u64>) -> &[(Range<usize>, Hsla)] {
+        key.and_then(|key| self.foregrounds.as_ref()?.get(&key))
+            .map_or(&[], Vec::as_slice)
     }
 
     fn image_source(&self, image: &ImageNode) -> ImageSource {
@@ -2770,6 +2788,27 @@ impl PartialEq for NodeContext {
 /// The text a mark covers, or nothing when its range does not fit the text.
 fn marked_text<'a>(text: &'a str, range: &Range<usize>) -> &'a str {
     text.get(range.clone()).unwrap_or_default()
+}
+
+/// The text color with more contrast against a highlight composited over the
+/// theme background (WCAG relative luminance).
+fn mark_text_color(highlight: Hsla, background: Hsla) -> Hsla {
+    fn channel(value: f32) -> f32 {
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    let rgb = background.to_rgb().blend(highlight.to_rgb());
+    let luminance = 0.2126 * channel(rgb.r) + 0.7152 * channel(rgb.g) + 0.0722 * channel(rgb.b);
+    // Contrast with black is (L + 0.05) / 0.05 and with white 1.05 / (L + 0.05);
+    // they are equal where (L + 0.05)^2 = 0.0525.
+    if (luminance + 0.05) * (luminance + 0.05) > 0.0525 {
+        gpui::black()
+    } else {
+        gpui::white()
+    }
 }
 
 /// The highlight a text mark renders with. The link decoration is applied by
@@ -2844,6 +2883,14 @@ fn mark_highlight(
     }
     if let Some(color) = mark.highlight {
         highlight.background_color = Some(color);
+        // Set the text color with the background, as the HTML standard's
+        // `mark { background: yellow; color: black }` does, so a light
+        // highlight stays readable in a dark theme.
+        // A transparent mark leaves the underlying surface unchanged. Keep
+        // its inherited foreground, including on custom-colored surfaces.
+        if color.a > 0.0 {
+            highlight.color = Some(mark_text_color(color, cx.theme().tokens.colors.background));
+        }
     }
     InlineHighlight {
         style: highlight,
@@ -3338,6 +3385,38 @@ impl Paragraph {
                 source_offset: 0,
                 reference: None,
             });
+        }
+
+        let foregrounds = node_cx.foregrounds(self.leaf_key());
+        if !foregrounds.is_empty() {
+            let mut offset = 0;
+            for item in &mut items {
+                match item {
+                    InlineFlowItem::Text {
+                        text, highlights, ..
+                    } => {
+                        *highlights = foreground_highlights(
+                            std::mem::take(highlights),
+                            text,
+                            offset,
+                            foregrounds,
+                        );
+                        offset += text.len();
+                    }
+                    InlineFlowItem::Object { style, .. } => {
+                        let end = offset + '\u{FFFC}'.len_utf8();
+                        if let Some((_, color)) = foregrounds
+                            .iter()
+                            .rev()
+                            .find(|(range, _)| range.start <= offset && end <= range.end)
+                        {
+                            style.color = Some(*color);
+                        }
+                        offset = end;
+                    }
+                    InlineFlowItem::Image { .. } => offset += '\u{FFFC}'.len_utf8(),
+                }
+            }
         }
 
         if let Some(resolve) = &node_cx.link_presentation {
@@ -3935,11 +4014,7 @@ impl BlockNode {
                                 .justify_center()
                                 .border_1()
                                 .border_color(
-                                    style
-                                        .list_style()
-                                        .text
-                                        .color
-                                        .unwrap_or(style.foreground()),
+                                    style.list_style().text.color.unwrap_or(style.foreground()),
                                 )
                                 .when(checked, |this| {
                                     this.bg(style.foreground()).child(
@@ -4598,7 +4673,9 @@ impl BlockNode {
                             let is_last = index == children_len - 1;
                             window.with_text_style(
                                 Some(node_cx.style.blockquote_style().text.clone()),
-                                |window| c.render_block(options.is_last(is_last), node_cx, window, cx),
+                                |window| {
+                                    c.render_block(options.is_last(is_last), node_cx, window, cx)
+                                },
                             )
                         })
                     })
@@ -4686,6 +4763,154 @@ impl BlockNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_foregrounds_follow_the_render_context_without_entering_the_paragraph_cache() {
+        let mut app = gpui::TestApp::new();
+        let mut window = app.open_window(|_, _| gpui::Empty);
+        window.update(|_, _, cx| {
+            cx.set_global(crate::Theme::default());
+            let link = LinkMark {
+                url: "https://example.com".into(),
+                ..Default::default()
+            };
+            let mut paragraph = Paragraph::default().with_leaf_key(7);
+            paragraph.push(InlineNode::new("a中😀link").marks(vec![
+                (0..12, TextMark::default().bold()),
+                (1..12, TextMark::default().italic().link(link.clone())),
+            ]));
+            let original = paragraph.clone();
+            let base = NodeContext::default();
+            let (_, inherited, _) = paragraph.plain_render(&base, cx);
+            let cached = paragraph.render_cache.0.lock().unwrap().clone().unwrap();
+            for color in [gpui::red(), gpui::blue()] {
+                let context = NodeContext {
+                    foregrounds: Some(Arc::new(HashMap::from([(7, vec![(0..12, color)])]))),
+                    ..base.clone()
+                };
+                let (text, highlights, links) = paragraph.plain_render(&context, cx);
+                assert_eq!(text.as_ref(), "a中😀link");
+                assert_eq!(links, vec![(1..12, link.clone())]);
+                assert!(highlights.iter().all(|(_, h)| h.style.color == Some(color)));
+                assert!(
+                    highlights
+                        .iter()
+                        .all(|(_, h)| h.style.font_weight == Some(FontWeight::BOLD))
+                );
+                assert!(
+                    highlights
+                        .iter()
+                        .filter(|(r, _)| r.start >= 1)
+                        .all(|(_, h)| h.style.font_style == Some(FontStyle::Italic)
+                            && h.style.underline.is_some())
+                );
+                assert!(Arc::ptr_eq(
+                    &cached,
+                    paragraph.render_cache.0.lock().unwrap().as_ref().unwrap()
+                ));
+            }
+            // Clearing a context's ranges restores inherited mark/link colors,
+            // even though the document and cached mark styles are unchanged.
+            let context = NodeContext {
+                foregrounds: Some(Arc::new(HashMap::from([(7, vec![])]))),
+                ..base.clone()
+            };
+            assert_eq!(paragraph.plain_render(&context, cx).1, inherited);
+            let invalid = NodeContext {
+                foregrounds: Some(Arc::new(HashMap::from([(7, vec![(2..3, gpui::red())])]))),
+                ..base.clone()
+            };
+            assert_eq!(paragraph.plain_render(&invalid, cx).1, inherited);
+            let other_leaf = NodeContext {
+                foregrounds: Some(Arc::new(HashMap::from([(8, vec![(0..12, gpui::red())])]))),
+                ..base
+            };
+            assert_eq!(paragraph.plain_render(&other_leaf, cx).1, inherited);
+            assert_eq!(paragraph, original);
+        });
+    }
+
+    #[test]
+    fn host_foregrounds_override_mixed_links_and_preserve_atom_byte_coordinates() {
+        let mut app = gpui::TestApp::new();
+        let mut window = app.open_window(|_, _| gpui::Empty);
+        window.update(|_, _, cx| {
+            cx.set_global(crate::Theme::default());
+            let link = LinkMark {
+                url: "https://example.com".into(),
+                ..Default::default()
+            };
+            let mut paragraph = Paragraph::default().with_leaf_key(7);
+            paragraph.push(InlineNode::new("a中😀link").marks(vec![
+                (0..12, TextMark::default().bold()),
+                (1..12, TextMark::default().link(link.clone())),
+                (4..8, TextMark::default().code()),
+            ]));
+            paragraph.push(
+                InlineNode::custom(MarkdownNode::new("atom", ()).text("long fallback"))
+                    .marks(vec![(0..13, TextMark::default().link(link.clone()))]),
+            );
+            paragraph.push(InlineNode::new("尾"));
+            paragraph.push(InlineNode::image(ImageNode::default()));
+            paragraph.push(InlineNode::new("z"));
+            let context = NodeContext {
+                foregrounds: Some(Arc::new(HashMap::from([(
+                    7,
+                    vec![
+                        (0..22, gpui::red()),
+                        (15..18, gpui::blue()),
+                        (21..22, gpui::blue()),
+                    ],
+                )]))),
+                ..Default::default()
+            };
+            let items = paragraph.inline_flow_items(None, &[], &[], &context, cx);
+            assert_eq!(items.len(), 5);
+            let InlineFlowItem::Text {
+                text,
+                highlights,
+                links,
+                ..
+            } = &items[0]
+            else {
+                panic!("text");
+            };
+            assert_eq!(text.as_ref(), "a中😀link");
+            assert_eq!(links, &vec![(1..12, link.clone())]);
+            assert!(
+                highlights
+                    .iter()
+                    .all(|(_, h)| h.style.color == Some(gpui::red()))
+            );
+            assert!(
+                highlights
+                    .iter()
+                    .any(|(r, h)| r.start == 4 && h.code_style.is_some())
+            );
+            let InlineFlowItem::Object {
+                style,
+                link: actual_link,
+                ..
+            } = &items[1]
+            else {
+                panic!("object");
+            };
+            assert_eq!(style.color, Some(gpui::red()));
+            assert_eq!(actual_link.as_ref(), Some(&link));
+            assert!(style.underline.is_some());
+            for ix in [2, 4] {
+                let InlineFlowItem::Text { highlights, .. } = &items[ix] else {
+                    panic!("trailing text");
+                };
+                assert!(
+                    highlights
+                        .iter()
+                        .all(|(_, h)| h.style.color == Some(gpui::blue()))
+                );
+                assert!(!highlights.is_empty());
+            }
+        });
+    }
 
     #[test]
     fn block_plugin_selection_copies_both_formats_and_clears_synchronously() {
@@ -4868,6 +5093,81 @@ mod tests {
         }
         assert_eq!(paragraph.selected_text(), "文 x² Eng");
         assert_eq!(paragraph.selected_source(), "文 **$x^2$** Eng");
+    }
+
+    #[test]
+    fn mark_sets_a_readable_text_color_with_its_background() {
+        use gpui::{Empty, TestApp};
+        let mut app = TestApp::new();
+        let mut window = app.open_window(|_, _| Empty);
+        window.update(|_, _, cx| {
+            cx.set_global(crate::Theme::default());
+            let node_cx = NodeContext::default();
+
+            // The default `<mark>` yellow needs dark text, whatever the theme's
+            // text color is (light in a dark theme).
+            let yellow: Hsla = gpui::rgb(0xfef08a).into();
+            let style =
+                mark_highlight(&TextMark::default().highlight(yellow), "", &node_cx, cx).style;
+            assert_eq!(style.background_color, Some(yellow));
+            assert_eq!(style.color, Some(gpui::black()));
+
+            // A dark custom highlight gets light text instead.
+            let navy: Hsla = gpui::rgb(0x1e3a8a).into();
+            let style =
+                mark_highlight(&TextMark::default().highlight(navy), "", &node_cx, cx).style;
+            assert_eq!(style.color, Some(gpui::white()));
+
+            // A translucent mark is composited with the theme surface before
+            // choosing the text color. Fully transparent marks keep inherited ink.
+            let translucent_black: Hsla = gpui::rgba(0x00000080).into();
+            let translucent_white: Hsla = gpui::rgba(0xffffff4d).into();
+            assert_eq!(
+                mark_text_color(translucent_black, gpui::white()),
+                gpui::black()
+            );
+            assert_eq!(
+                mark_text_color(translucent_white, gpui::black()),
+                gpui::white()
+            );
+            let transparent: Hsla = gpui::rgba(0x00000000).into();
+            let style = mark_highlight(
+                &TextMark::default().highlight(transparent),
+                "",
+                &node_cx,
+                cx,
+            )
+            .style;
+            assert_eq!(style.color, None);
+
+            // Text that is not marked keeps the inherited color.
+            let style = mark_highlight(&TextMark::default().bold(), "", &node_cx, cx).style;
+            assert_eq!(style.color, None);
+        });
+    }
+
+    #[test]
+    fn translucent_mark_cache_tracks_theme_background() {
+        use gpui::{Empty, TestApp};
+        let mut app = TestApp::new();
+        let mut window = app.open_window(|_, _| Empty);
+        window.update(|_, _, cx| {
+            cx.set_global(crate::Theme::default());
+            let paragraph = Paragraph {
+                children: vec![InlineNode::new("mark").marks(vec![(
+                    0..4,
+                    TextMark::default().highlight(gpui::rgba(0x00000033).into()),
+                )])],
+                ..Default::default()
+            };
+            let context = NodeContext::default();
+            crate::Theme::global_mut(cx).tokens.colors.background = gpui::white();
+            let (_, light, _) = paragraph.plain_render(&context, cx);
+            assert_eq!(light[0].1.style.color, Some(gpui::black()));
+            crate::Theme::global_mut(cx).tokens.colors.background = gpui::black();
+            let (_, dark, _) = paragraph.plain_render(&context, cx);
+            assert_eq!(dark[0].1.style.color, Some(gpui::white()));
+        });
     }
 
     #[test]

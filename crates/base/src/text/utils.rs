@@ -3,8 +3,6 @@ use std::sync::Arc;
 use data_url::DataUrl;
 use gpui::{Image, ImageFormat};
 
-const LOWER_ALPHA: &str = "abcdefghijklmnopqrstuvwxyz";
-
 const BULLETS: [&str; 5] = ["•", "◦", "▪", "‣", "⁃"];
 
 const ROMAN: [(u32, &str); 13] = [
@@ -63,14 +61,16 @@ pub(super) fn list_item_prefix(
             return format!("{ordinal}. ");
         }
         if depth == 1 {
-            let alpha_ix = ordinal.saturating_sub(1) as usize;
-            return format!(
-                "{}. ",
-                LOWER_ALPHA
-                    .chars()
-                    .nth(alpha_ix % LOWER_ALPHA.len())
-                    .unwrap()
-            );
+            // CSS's `lower-alpha`, continuing past `z` as `aa`, `ab`, ...
+            let mut remaining = ordinal;
+            let mut letters = Vec::new();
+            while remaining > 0 {
+                remaining -= 1;
+                letters.push((b'a' + (remaining % 26) as u8) as char);
+                remaining /= 26;
+            }
+            let label: String = letters.into_iter().rev().collect();
+            return format!("{label}. ");
         }
         return format!("{}. ", lower_roman(ordinal));
     }
@@ -121,6 +121,33 @@ mod tests {
         assert!(data_url_image("data:text/plain;base64,aGVsbG8=").is_none());
         assert!(data_url_image("data:image/png;base64,not*base64").is_none());
         assert!(data_url_image("data:image/png").is_none());
+    }
+
+    #[test]
+    fn test_alphabetic_list_item_prefix() {
+        for (ordinal, label) in [
+            (1, "A"),
+            (26, "Z"),
+            (27, "AA"),
+            (28, "AB"),
+            (52, "AZ"),
+            (53, "BA"),
+            (702, "ZZ"),
+            (703, "AAA"),
+            (u32::MAX, "MWLQKWU"),
+        ] {
+            // Ghostex: the second level counts in lower-case letters (CSS's `lower-alpha`).
+            let expected = format!("{}. ", label.to_ascii_lowercase());
+            assert_eq!(list_item_prefix(0, Some(ordinal), true, 1), expected);
+            assert_eq!(
+                list_item_prefix((ordinal - 1) as usize, None, true, 1),
+                expected
+            );
+        }
+        assert_eq!(list_item_prefix(1, Some(26), true, 1), "aa. ");
+        assert_eq!(list_item_prefix(usize::MAX, Some(1), true, 1), "mwlqkwu. ");
+        assert_eq!(list_item_prefix(26, Some(1), true, 0), "27. ");
+        assert_eq!(list_item_prefix(27, Some(0), true, 1), "27. ");
     }
 
     #[test]

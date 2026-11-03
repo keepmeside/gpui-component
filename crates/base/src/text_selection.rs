@@ -10,8 +10,8 @@ use gpui::{
     App, AppContext as _, Bounds, Context, Element, ElementId, Entity, EntityId, EventEmitter,
     Global, GlobalElementId, Half, Hitbox, HitboxBehavior, Hsla, InputEvent as _,
     InspectorElementId, IntoElement, LayoutId, LongPressEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent, SharedString,
-    Style, Subscription, TextLayout, TouchDragEvent, TouchPhase, WeakEntity, Window, point, px,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent, SharedString, Style,
+    Subscription, TextLayout, TouchDragEvent, TouchPhase, WeakEntity, Window, point, px,
 };
 
 use crate::text_boundary::{line_range_at, word_range_at};
@@ -972,6 +972,16 @@ impl TextSelectionHandle {
     /// Projects the current snapshot onto plain-text runs and caches their copy text.
     pub fn update_runs(&self, runs: &[TextSelectionRun], cx: &mut App) -> TextSelectionProjection {
         self.0.read(cx).update_runs(runs)
+    }
+
+    /// The projected text this participant adds to the window's selected
+    /// text, or `None` when it adds none or copies through its own callback.
+    pub(crate) fn projected_copy_text(&self, cx: &App) -> Option<String> {
+        self.0
+            .read(cx)
+            .copy_item(0, false)
+            .filter(|item| item.callback.is_none())
+            .map(|item| item.fallback)
     }
 
     // Rich text renders its own selection; retain geometry only for word hit testing.
@@ -1984,7 +1994,7 @@ impl WindowSelectionState {
         // its first painted run to its last.
         if let Some(anchor) = self.runs.anchor {
             let run_groups = self.run_groups.borrow();
-        let document = runs::Document::new(&run_groups, self.active_scope);
+            let document = runs::Document::new(&run_groups, self.active_scope);
             let indices = document
                 .runs
                 .iter()
@@ -2098,7 +2108,7 @@ impl WindowSelectionState {
             // A `TextView` selection is re-anchored on the run at the held
             // end, and the finger moves its head.
             let run_groups = self.run_groups.borrow();
-        let document = runs::Document::new(&run_groups, self.active_scope);
+            let document = runs::Document::new(&run_groups, self.active_scope);
             let Some(held) = document.nearest(anchor_point) else {
                 return;
             };
@@ -3604,8 +3614,7 @@ fn paint_text_selection(state: &Entity<WindowSelectionState>, window: &mut Windo
             // A move without the button down after a press means its release
             // never reached the window (the Windows caption move loop eats
             // it), so the press ends here rather than selecting on hover.
-            if event.pressed_button != Some(MouseButton::Left)
-                && state.read(cx).mouse_down_prepared
+            if event.pressed_button != Some(MouseButton::Left) && state.read(cx).mouse_down_prepared
             {
                 state.update(cx, |state, cx| {
                     state.mouse_down_prepared = false;
