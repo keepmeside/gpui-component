@@ -23,7 +23,7 @@ use crate::text::text_view::{
 use crate::text_selection::runs::RunSource;
 
 use super::{
-    inline::{Inline, InlineHighlight, InlineState, code_insets, text_runs, text_size_ranges},
+    inline::{Inline, InlineHighlight, InlineState, code_insets, text_runs},
     inline_object::{InlineObject, MeasuredInlineObject},
     node::LinkMark,
     range_highlight::RevealAt,
@@ -1844,7 +1844,15 @@ fn line_ranges(
         // shaped run (CoreText sets an isolated full-width `，` at half width).
         // Check each line against the shaped spans and re-wrap it tighter when
         // it overflows, so the painted line never exceeds `wrap_width`.
-        let spans = shaped_spans(items, image_sizes, objects, text_style, &hard_line, window);
+        let spans = shaped_spans(
+            items,
+            image_sizes,
+            objects,
+            text_style,
+            &hard_line,
+            wrap_width,
+            window,
+        );
         let mut start = hard_line.start;
         while start < hard_line.end {
             let rest = fragments_from(&wrap_fragments, start - hard_line.start);
@@ -1933,12 +1941,17 @@ fn fragments_from<'a>(
 }
 
 /// One run of a hard line as the renderer lays it out: text shaped once in
-/// context, or an object / image of fixed width. Ranges are hard-line offsets.
+/// context, or an object / image / reference chip of fixed width. Ranges are
+/// hard-line offsets.
 enum ShapedSpan {
     Text {
         range: Range<usize>,
         line: Box<ShapedLine>,
         padding: Pixels,
+        /// Ghostex fork: a host chip's leading and trailing edges, counted
+        /// when a measured range starts or ends where the chip does, as the
+        /// flow gives them only to the chip's first and last fragments.
+        chip_edges: (Pixels, Pixels),
     },
     Fixed {
         range: Range<usize>,
@@ -1952,6 +1965,7 @@ fn shaped_spans(
     objects: &[Option<MeasuredInlineObject>],
     text_style: &TextStyle,
     hard_line: &Range<usize>,
+    wrap_width: Pixels,
     window: &mut Window,
 ) -> Vec<ShapedSpan> {
     let font_size = text_style.font_size.to_pixels(window.rem_size());
@@ -1961,13 +1975,35 @@ fn shaped_spans(
         let item_end = item_start + item.len();
         if item_end > hard_line.start && item_start < hard_line.end {
             match item {
+                // Ghostex fork: a reference is one piece as wide as the flow
+                // lays it out: its label, icon and frame, narrowed to the line.
+                // Measured as its label alone, a line that opens with a
+                // question tag looked to fit when it did not, and its last
+                // words were painted past the edge.
+                MeasureItem::Text {
+                    text,
+                    highlights,
+                    reference: Some(reference),
+                    ..
+                } => {
+                    let runs = text_runs(text.len(), text_style, highlights);
+                    let natural = shape_line(text.clone(), font_size, &runs, window).width()
+                        + reference.extra_width();
+                    spans.push(ShapedSpan::Fixed {
+                        range: item_start..item_end,
+                        width: natural.min(wrap_width),
+                    });
+                }
                 MeasureItem::Text {
                     text, highlights, ..
                 } => {
                     let local_start = hard_line.start.max(item_start) - item_start;
                     let local_end = hard_line.end.min(item_end) - item_start;
-                    for (segment, scale) in
-                        text_size_ranges(text.len(), highlights, font_size, window.rem_size())
+                    // Ghostex fork: split as the flow is, so a host chip's
+                    // edges are counted on the fragments the flow pads.
+                    let chip_spans = chip_spans(highlights);
+                    for (segment, scale, chip) in
+                        flow_segments(text.len(), highlights, font_size, window.rem_size())
                     {
                         let start = local_start.max(segment.start);
                         let end = local_end.min(segment.end);
@@ -1986,10 +2022,27 @@ fn shaped_spans(
                         ));
                         let insets = code_insets(&highlights, font_size * scale, window.rem_size());
                         let padding = insets.left + insets.right;
+                        let chip_edges = chip.map_or((Pixels::ZERO, Pixels::ZERO), |chip| {
+                            let span = chip_spans
+                                .iter()
+                                .find(|(span, style)| {
+                                    Arc::ptr_eq(style, &chip) && span.contains(&start)
+                                })
+                                .map_or(segment.clone(), |(span, _)| span.clone());
+                            let font_height =
+                                super::inline_code::chip_font_height(text_style, &chip, window);
+                            super::inline_code::chip_edges(
+                                &chip,
+                                start == span.start,
+                                end == span.end,
+                                font_height,
+                            )
+                        });
                         spans.push(ShapedSpan::Text {
                             range: item_start + start..item_start + end,
                             line,
                             padding,
+                            chip_edges,
                         });
                     }
                 }
@@ -2022,15 +2075,28 @@ fn spans_width(spans: &[ShapedSpan], range: Range<usize>) -> Pixels {
                 range: span_range,
                 line,
                 padding,
+                chip_edges: (leading, trailing),
             } => {
                 let start = range.start.max(span_range.start);
                 let end = range.end.min(span_range.end);
                 if start >= end {
                     return Pixels::ZERO;
                 }
+                let leading = if start == span_range.start {
+                    *leading
+                } else {
+                    Pixels::ZERO
+                };
+                let trailing = if end == span_range.end {
+                    *trailing
+                } else {
+                    Pixels::ZERO
+                };
                 line.x_for_index(end - span_range.start)
                     - line.x_for_index(start - span_range.start)
                     + *padding
+                    + leading
+                    + trailing
             }
             ShapedSpan::Fixed {
                 range: span_range,
@@ -2681,6 +2747,106 @@ mod tests {
                 })
                 .collect();
             assert_eq!(reconstructed, text);
+        }
+    }
+
+    /// Ghostex fork: a line that opens with a framed reference chip and holds
+    /// a host's code chip wraps inside `wrap_width` at every width, and lays
+    /// out every byte. The check that keeps a rest which fits on one line
+    /// measured the line without the chips' icon, frame and padding, so at
+    /// widths just under the line's real width the whole rest stayed on one
+    /// line and its last word was painted past the edge, clipped away.
+    #[test]
+    fn a_line_with_chips_wraps_inside_the_width_at_every_width() {
+        use super::super::inline::test_fonts::{BODY, MONO, WideMonoTextSystem};
+        use super::super::{InlineCodeStyle, InlineLink, InlineLinkFrame};
+        use gpui::{Empty, Hsla, TestApp};
+
+        let mut app = TestApp::with_text_system(Arc::new(WideMonoTextSystem));
+        let mut window = app.open_window(|_, _| Empty);
+        let font_size = px(10.);
+        let style = TextStyle {
+            font_family: BODY.into(),
+            font_size: AbsoluteLength::Pixels(font_size),
+            ..Default::default()
+        };
+        let code = InlineCodeStyle {
+            font_family: MONO.into(),
+            font_scale: 1.,
+            padding_x: px(5.),
+            padding_y: px(1.),
+            border_width: px(1.),
+            radius: px(4.),
+            background: Hsla::default(),
+            border_color: Hsla::default(),
+            swatches: false,
+            swatch: None,
+            swatch_border_width: Pixels::ZERO,
+            swatch_border_color: Hsla::default(),
+            prose: false,
+        };
+        let tag = InlineLink {
+            label: "Q1268".into(),
+            icon: "question.svg".into(),
+            icon_size: px(12.),
+            gap: px(4.),
+            frame: Some(InlineLinkFrame {
+                padding_x: px(7.),
+                border_width: px(1.),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let text = ": Should cargo xtask rebuild start its build the next time a shell goes stale?";
+        let code_start = text.find("cargo").unwrap();
+        let code_range = code_start..code_start + "cargo xtask rebuild".len();
+        let items = vec![
+            MeasureItem::Text {
+                text: "Q1268".into(),
+                links: vec![],
+                highlights: vec![],
+                reference: Some(tag),
+            },
+            MeasureItem::Text {
+                text: text.into(),
+                links: vec![],
+                highlights: vec![(
+                    code_range,
+                    InlineHighlight {
+                        font_family: Some(MONO.into()),
+                        font_size_scale: Some(1.),
+                        chip: Some(Arc::new(code)),
+                        ..Default::default()
+                    },
+                )],
+                reference: None,
+            },
+        ];
+        let whole = window.update(|_, window, cx| {
+            layout_flow(&items, &[None, None], &style, None, window, cx)
+                .size
+                .width
+        });
+        let mut width = px(120.);
+        while width <= whole + px(20.) {
+            let layout = window.update(|_, window, cx| {
+                layout_flow(&items, &[None, None], &style, Some(width), window, cx)
+            });
+            assert!(
+                layout.size.width <= width,
+                "at {width:?} the flow is {:?} wide",
+                layout.size.width
+            );
+            let laid_out: String = layout
+                .fragments
+                .iter()
+                .filter_map(|fragment| match fragment {
+                    PositionedFragment::Text { text, .. } => Some(text.as_ref()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(laid_out, format!("Q1268{text}"), "at {width:?}");
+            width += px(0.5);
         }
     }
 
