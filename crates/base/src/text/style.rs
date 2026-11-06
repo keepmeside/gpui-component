@@ -86,6 +86,9 @@ pub struct TextViewStyle {
     /// [`Self::on_text_color`] sets it, to let a table on an inverted surface
     /// show that surface.
     table_background: Option<Hsla>,
+    /// The background of a hovered table body row, or no hover highlight
+    /// when `None`.
+    table_row_hover: Option<Hsla>,
     is_dark: bool,
 }
 
@@ -123,6 +126,7 @@ impl PartialEq for TextViewStyle {
             && self.list_style == other.list_style
             && self.blockquote_style == other.blockquote_style
             && self.table_background == other.table_background
+            && self.table_row_hover == other.table_row_hover
             && self.is_dark == other.is_dark
     }
 }
@@ -183,6 +187,7 @@ impl TextViewStyle {
             list_style: StyleRefinement::default(),
             blockquote_style: StyleRefinement::default(),
             table_background: None,
+            table_row_hover: None,
             is_dark,
         }
     }
@@ -445,6 +450,15 @@ impl TextViewStyle {
         self
     }
 
+    /// Sets the background of a table body row while the pointer is over it.
+    ///
+    /// The header row does not highlight. Without this, table rows have no
+    /// hover highlight.
+    pub fn with_table_row_hover(mut self, color: Hsla) -> Self {
+        self.table_row_hover = Some(color);
+        self
+    }
+
     /// Sets whether content-specific assets should use their dark variant.
     pub fn with_dark(mut self, is_dark: bool) -> Self {
         self.is_dark = is_dark;
@@ -621,6 +635,11 @@ impl TextViewStyle {
         self.table_background
     }
 
+    /// The background of a hovered table body row, if rows highlight on hover.
+    pub fn table_row_hover(&self) -> Option<Hsla> {
+        self.table_row_hover
+    }
+
     /// Returns the [`HighlightStyle`] to use for inline code, falling back to
     /// the code background when no custom background was supplied.
     pub(crate) fn inline_code_highlight(&self) -> HighlightStyle {
@@ -637,8 +656,8 @@ impl TextViewStyle {
     /// The body text always takes `color`. When `color` is far from this
     /// style's foreground in lightness, the surface is inverted from the one
     /// this style was made for (a `primary` fill, say): the link, muted text,
-    /// code, border and selection colors would vanish on it, so they are all
-    /// derived from `color`, and [`Self::is_dark`] flips.
+    /// code, border, selection and table row hover colors would vanish on it,
+    /// so they are all derived from `color`, and [`Self::is_dark`] flips.
     pub(crate) fn on_text_color(&self, color: Hsla) -> Self {
         let style = self.clone().with_foreground(color);
         if !self.is_inverted_by(color) {
@@ -662,6 +681,7 @@ impl TextViewStyle {
             .with_table_head(table_head)
             .with_dark(!self.is_dark);
         style.table_background = Some(gpui::transparent_black());
+        style.table_row_hover = self.table_row_hover.map(|_| color.opacity(0.08));
         style
     }
 

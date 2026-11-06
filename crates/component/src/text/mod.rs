@@ -59,6 +59,7 @@ pub(crate) fn base_text_view_style(theme: &crate::Theme) -> gpui_base::TextViewS
         .with_code_block(code_block)
         .with_table(table)
         .with_table_head(table_head)
+        .with_table_row_hover(theme.table_hover)
         .with_inline_code(gpui::HighlightStyle {
             background_color: Some(theme.accent),
             ..Default::default()

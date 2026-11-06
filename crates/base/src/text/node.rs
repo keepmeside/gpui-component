@@ -4426,6 +4426,9 @@ impl BlockNode {
             }
             rows.push(
                 div()
+                    // GPUI keys hover state by element id, so each row needs
+                    // its own for its hover highlight to follow the pointer.
+                    .id(("row", row_ix))
                     .w_full()
                     .when(row_ix < row_count - 1, |this| this.border_b_1())
                     .border_color(style.border())
@@ -4440,6 +4443,11 @@ impl BlockNode {
                             .text_color(style.foreground())
                             .refine_style(&style.table_head())
                     })
+                    // Body rows only: the header keeps its own fill.
+                    .when_some(
+                        style.table_row_hover().filter(|_| row_ix > 0),
+                        |this, color| this.hover(|this| this.bg(color)),
+                    )
                     .children(cells),
             );
         }
@@ -4544,6 +4552,9 @@ impl BlockNode {
 
             rows.push(
                 div()
+                    // GPUI keys hover state by element id, so each row needs
+                    // its own for its hover highlight to follow the pointer.
+                    .id(("row", row_ix))
                     .w_full()
                     .when(row_ix < row_count - 1, |this| this.border_b_1())
                     .border_color(style.border())
@@ -4558,6 +4569,11 @@ impl BlockNode {
                             .text_color(style.foreground())
                             .refine_style(&style.table_head())
                     })
+                    // Body rows only: the header keeps its own fill.
+                    .when_some(
+                        style.table_row_hover().filter(|_| row_ix > 0),
+                        |this, color| this.hover(|this| this.bg(color)),
+                    )
                     .children(cells),
             );
         }
@@ -4567,6 +4583,9 @@ impl BlockNode {
             .w_full()
             .child(
                 div()
+                    // Scopes the row ids to this table, as the scroll area's id
+                    // does, so rows of two tables never share hover state.
+                    .id(block_element_id("table", table.span, options.ix))
                     .w_full()
                     .bg(style
                         .table_background()
