@@ -9,8 +9,9 @@ use crate::{Side, Size, kbd::Kbd};
 use gpui::{
     Action, Anchor, AnyElement, App, AppContext, Bounds, Context, DismissEvent, Edges, Entity,
     EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding,
-    ParentElement, Pixels, Render, Role, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, WeakEntity, Window, anchored, deferred, div, prelude::FluentBuilder, px, rems,
+    ParentElement, Pixels, Rems, Render, Role, ScrollHandle, SharedString,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, anchored, deferred, div,
+    prelude::FluentBuilder, px, rems,
 };
 use gpui::{ClickEvent, Half, MouseDownEvent, OwnedMenuItem, Point, Subscription};
 use gpui_base::TestSupportExt as _;
@@ -19,6 +20,10 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 const CONTEXT: &str = "PopupMenu";
+
+/// How many frames a newly opened scrollable menu waits for its items to be
+/// measured before it gives up scrolling to the checked item.
+const SCROLL_TO_CHECKED_FRAMES: u8 = 4;
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -335,6 +340,9 @@ pub struct PopupMenu {
     scrollable: bool,
     scrollbar_show: Option<ScrollbarMode>,
     scrollbar_thickness: Option<Pixels>,
+    /// Frames left to scroll the checked item into view on open. Zero once
+    /// done, so the user's scrolling is not overridden afterwards.
+    scroll_to_checked_frames: u8,
     external_link_icon: bool,
     scroll_handle: ScrollHandle,
     // This will update on render
@@ -382,6 +390,7 @@ impl PopupMenu {
             scrollable: false,
             scrollbar_show: None,
             scrollbar_thickness: None,
+            scroll_to_checked_frames: SCROLL_TO_CHECKED_FRAMES,
             scroll_handle: ScrollHandle::default(),
             external_link_icon: true,
             size: Size::default(),
@@ -470,19 +479,21 @@ impl PopupMenu {
         }
     }
 
-    /// Set min width of the popup menu, default is 120px
+    /// Set min width of the popup menu, default is 8rem
     pub fn min_w(mut self, width: impl Into<Pixels>) -> Self {
         self.min_width = Some(width.into());
         self
     }
 
-    /// Set max width of the popup menu, default is 500px
+    /// Set max width of the popup menu, default is 31.25rem (500px at the
+    /// default 16px rem)
     pub fn max_w(mut self, width: impl Into<Pixels>) -> Self {
         self.max_width = Some(width.into());
         self
     }
 
-    /// Set max height of the popup menu, default is half of the window height
+    /// Set max height of the popup menu, default is half of the window height,
+    /// at most 28.125rem (450px at the default 16px rem)
     pub fn max_h(mut self, height: impl Into<Pixels>) -> Self {
         self.max_height = Some(height.into());
         self
@@ -1006,6 +1017,47 @@ impl PopupMenu {
         }
     }
 
+    /// Scroll a scrollable menu once, as it opens, so its checked item is the
+    /// first one in view, the way a native picker opens on its current value.
+    ///
+    /// `ScrollHandle::scroll_to_top_of_item` is not used: it measures the item
+    /// against the container bounds recorded on the previous frame, which a
+    /// just-opened `anchored` menu does not have at its final position yet, so
+    /// it would land off by the distance the menu moved. The offset here is
+    /// the distance between the first item and the checked one, measured in
+    /// the same frame, so it does not depend on where the container is. Items
+    /// are measured on the first prepaint, so until then this asks for another
+    /// frame, up to `SCROLL_TO_CHECKED_FRAMES` times.
+    fn scroll_to_checked_item(&mut self, cx: &mut Context<Self>) {
+        if !self.scrollable || self.scroll_to_checked_frames == 0 {
+            return;
+        }
+
+        // Only a trailing separator is not rendered, so an item's index is
+        // also its index among the scroll container's children.
+        let checked_ix = self.menu_items.iter().position(|item| item.is_checked());
+        let Some(ix) = checked_ix.filter(|ix| *ix > 0) else {
+            self.scroll_to_checked_frames = 0;
+            return;
+        };
+
+        match (
+            self.scroll_handle.bounds_for_item(0),
+            self.scroll_handle.bounds_for_item(ix),
+        ) {
+            (Some(first), Some(checked)) => {
+                self.scroll_to_checked_frames = 0;
+                let mut offset = self.scroll_handle.offset();
+                offset.y = first.top() - checked.top();
+                self.scroll_handle.set_offset(offset);
+            }
+            _ => {
+                self.scroll_to_checked_frames -= 1;
+                cx.notify();
+            }
+        }
+    }
+
     fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
         let ix = self.selected_index.unwrap_or(0);
@@ -1283,11 +1335,6 @@ impl PopupMenu {
         Some(icon.xsmall())
     }
 
-    #[inline]
-    fn max_width(&self) -> Pixels {
-        self.max_width.unwrap_or(px(500.))
-    }
-
     /// Calculate the anchor corner and left offset for child submenu
     fn update_submenu_menu_anchor(&mut self, window: &Window, cx: &App) {
         let bounds = self.bounds;
@@ -1302,10 +1349,14 @@ impl PopupMenu {
             })
             .filter(|width| *width > Pixels::ZERO)
             .unwrap_or(bounds.size.width);
+        let rem_size = window.rem_size();
         let (anchor, left) = if bounds.right() + submenu_width > window.viewport_size().width {
-            (Anchor::TopRight, -px(16.))
+            (Anchor::TopRight, -rems(1.).to_pixels(rem_size))
         } else {
-            (Anchor::TopLeft, bounds.size.width - px(8.))
+            (
+                Anchor::TopLeft,
+                bounds.size.width - rems(0.5).to_pixels(rem_size),
+            )
         };
 
         let is_bottom_pos = bounds.origin.y + bounds.size.height > window.bounds().size.height;
@@ -1334,17 +1385,19 @@ impl PopupMenu {
 
         let selected = self.selected_index == Some(ix);
         const EDGE_PADDING: Pixels = px(4.);
-        const INNER_PADDING: Pixels = px(8.);
+        const INNER_PADDING: Rems = rems(0.5);
 
         let is_submenu = matches!(item, PopupMenuItem::Submenu { .. });
 
         let (item_height, radius) = match self.size {
-            Size::Small => (px(20.), options.radius.half()),
-            _ => (px(26.), options.radius),
+            Size::Small => (rems(1.25), options.radius.half()),
+            _ => (rems(1.625), options.radius),
         };
-        let item_height = self
+        // Ghostex fork: an appearance gives an absolute item height; the
+        // default heights stay in rems (#3809).
+        let item_height: gpui::AbsoluteLength = self
             .appearance
-            .map_or(item_height, |style| style.item_height);
+            .map_or(item_height.into(), |style| style.item_height.into());
 
         let this = MenuItemElement::new(ix)
             .relative()
@@ -1596,12 +1649,14 @@ impl Render for PopupMenu {
             }
         }
 
+        self.scroll_to_checked_item(cx);
+
         let view = cx.entity().clone();
         let items_count = self.menu_items.len();
 
         let max_height = self.max_height.unwrap_or_else(|| {
             let window_half_height = window.window_bounds().get_bounds().size.height * 0.5;
-            window_half_height.min(px(450.))
+            window_half_height.min(rems(28.125).to_pixels(window.rem_size()))
         });
 
         let has_left_icon = self
@@ -1609,7 +1664,6 @@ impl Render for PopupMenu {
             .iter()
             .any(|item| item.has_left_icon(self.check_side));
 
-        let max_width = self.max_width();
         let options = RenderOptions {
             has_left_icon,
             check_side: self.check_side,
@@ -1658,7 +1712,10 @@ impl Render for PopupMenu {
                     .gap_y_0p5()
                     .min_w(rems(8.))
                     .when_some(self.min_width, |this, min_width| this.min_w(min_width))
-                    .max_w(max_width)
+                    .map(|this| match self.max_width {
+                        Some(max_width) => this.max_w(max_width),
+                        None => this.max_w(rems(31.25)),
+                    })
                     .when(self.scrollable, |this| {
                         this.max_h(max_height)
                             .overflow_y_scroll()
