@@ -36,6 +36,10 @@ pub struct InlineLink {
     /// Ghostex fork: the icon's own tint, when it differs from the label's
     /// (an agent's logo in its brand colour beside a neutral label).
     pub icon_color: Option<Hsla>,
+    /// Stella fork: draw the icon as a full-colour image instead of a tinted
+    /// mask, for artwork that carries its own colours (a file's type icon).
+    /// `icon_color` is ignored then.
+    pub icon_image: bool,
     /// Ellipsize from the start when the chip is wider than the line, so a
     /// path keeps its file name visible.
     pub truncate_start: bool,
@@ -318,13 +322,21 @@ pub(super) fn element(
             this.tooltip(move |window, cx| tooltip(title.clone(), window, cx))
         })
         .when(!reference.icon.is_empty(), |this| {
-            this.child(
-                svg()
-                    .path(reference.icon.clone())
-                    .size(reference.icon_size)
-                    .text_color(reference.icon_color.unwrap_or(reference.color))
-                    .flex_shrink_0(),
-            )
+            if reference.icon_image {
+                this.child(
+                    gpui::img(reference.icon.clone())
+                        .size(reference.icon_size)
+                        .flex_shrink_0(),
+                )
+            } else {
+                this.child(
+                    svg()
+                        .path(reference.icon.clone())
+                        .size(reference.icon_size)
+                        .text_color(reference.icon_color.unwrap_or(reference.color))
+                        .flex_shrink_0(),
+                )
+            }
         })
         .child(
             div()

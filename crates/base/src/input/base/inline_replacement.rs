@@ -40,6 +40,10 @@ pub struct InlineReplacement {
     pub color: Option<Hsla>,
     /// Asset path of a monochrome icon drawn over the replacement's leading space.
     pub icon: Option<SharedString>,
+    /// Stella fork: draw the icon as a full-colour image (`img`) instead of a
+    /// mask tinted with `color`, for artwork that carries its own colours
+    /// (a file's type icon).
+    pub icon_image: bool,
     /// Edge length of the icon.
     pub icon_size: Pixels,
     /// Distance from the replacement's left edge to the icon's left edge.
@@ -57,6 +61,7 @@ impl InlineReplacement {
             text: text.into(),
             color: None,
             icon: None,
+            icon_image: false,
             icon_size: px(0.),
             icon_inset: px(0.),
             pointer: false,
@@ -73,6 +78,12 @@ impl InlineReplacement {
         self.icon = Some(icon.into());
         self.icon_size = size;
         self.icon_inset = inset;
+        self
+    }
+
+    /// Stella fork: draw the icon in its own colours (see `icon_image`).
+    pub fn image_icon(mut self, image: bool) -> Self {
+        self.icon_image = image;
         self
     }
 

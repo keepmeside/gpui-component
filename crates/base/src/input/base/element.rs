@@ -2680,6 +2680,7 @@ impl<M: InputModeKind> TextElement<M> {
                     bounds: rect,
                     underline_y: rect.origin.y + underline_offset,
                     icon: span.icon.clone(),
+                    icon_image: span.icon_image,
                     icon_size: span.icon_size,
                     icon_inset: span.icon_inset,
                     color: dim(span.color.unwrap_or(style.color)),
@@ -2709,20 +2710,39 @@ impl<M: InputModeKind> TextElement<M> {
                 window.set_cursor_style(gpui::CursorStyle::PointingHand, &pill.hitbox);
             }
             if let Some(icon) = &pill.icon {
-                _ = window.paint_svg(
-                    Bounds::new(
-                        point(
-                            pill.bounds.origin.x + pill.icon_inset,
-                            pill.bounds.origin.y + (line_height - pill.icon_size).half(),
-                        ),
-                        size(pill.icon_size, pill.icon_size),
+                let icon_bounds = Bounds::new(
+                    point(
+                        pill.bounds.origin.x + pill.icon_inset,
+                        pill.bounds.origin.y + (line_height - pill.icon_size).half(),
                     ),
-                    icon.clone(),
-                    None,
-                    gpui::TransformationMatrix::unit(),
-                    pill.color,
-                    cx,
+                    size(pill.icon_size, pill.icon_size),
                 );
+                if pill.icon_image {
+                    // Stella fork: full-colour artwork. Until the asset has loaded nothing
+                    // is drawn; `use_asset` redraws this view once it is ready.
+                    if let Some(Ok(image)) = window.use_asset::<gpui::ImgResourceLoader>(
+                        &gpui::Resource::Embedded(icon.clone()),
+                        cx,
+                    ) {
+                        _ = window.paint_image(
+                            icon_bounds,
+                            icon_bounds,
+                            gpui::Corners::default(),
+                            image,
+                            0,
+                            false,
+                        );
+                    }
+                } else {
+                    _ = window.paint_svg(
+                        icon_bounds,
+                        icon.clone(),
+                        None,
+                        gpui::TransformationMatrix::unit(),
+                        pill.color,
+                        cx,
+                    );
+                }
             }
             if !pill.hitbox.is_hovered(window) {
                 continue;
@@ -3207,6 +3227,7 @@ struct InlineReplacementPill {
     bounds: Bounds<Pixels>,
     underline_y: Pixels,
     icon: Option<SharedString>,
+    icon_image: bool,
     icon_size: Pixels,
     icon_inset: Pixels,
     color: Hsla,
